@@ -7,12 +7,17 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     Qt,
     QTimer,
+    QUrl,
 )
 
 from PySide6.QtGui import (
     QGuiApplication,
     QIcon,
     QPixmap,
+)
+
+from PySide6.QtMultimedia import (
+    QSoundEffect,
 )
 
 from PySide6.QtWidgets import (
@@ -97,9 +102,17 @@ def main():
 
     app.setWindowIcon(icon)
 
+    startup_sound = QSoundEffect()
+
+    startup_sound.setSource(QUrl.fromLocalFile(asset_path("audio", "startup.wav")))
+
+    startup_sound.setVolume(0.5)
+
     splash = SplashScreen()
 
     splash.show()
+
+    startup_sound.play()
 
     app.processEvents()
 
