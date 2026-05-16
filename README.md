@@ -25,3 +25,6 @@ Professional Open Source PDF Toolkit Desktop Software.
 
 ```bash
 python app/main.py
+
+
+.\venv\Scripts\activate 
