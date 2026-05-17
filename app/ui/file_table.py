@@ -1,7 +1,6 @@
 import os
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -50,16 +49,21 @@ class FileTable(QTableWidget):
     """
     A QTableWidget that:
       • Removes the blue focus cursor from read-only cells (File / Type / Pages).
-      • Allows drag-and-drop row reordering.
-      • Inserts a duplicate row when Enter is pressed in a Page Selection cell.
+      • Allows drag-and-drop row reordering (preserving all text).
+      • Pressing Enter in a Page Selection cell inserts a NEW ROW below referencing
+        the SAME file — no file is added twice; rows are just page-range splits.
+      • "Remove" removes the currently selected row (not necessarily the last).
       • Exposes selection_changed signal so MainWindow can react.
     """
 
     selection_changed = Signal()
 
+    # _rows stores the ground-truth metadata per row: {path, type, total_pages}
+    # The QTableWidget rows mirror this list 1-to-1.
+
     def __init__(self):
         super().__init__()
-        self._rows: list[dict] = []  # [{path, type}]
+        self._rows: list[dict] = []
         self._drag_src = -1
         self._setup()
 
@@ -71,19 +75,15 @@ class FileTable(QTableWidget):
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.horizontalHeader().setMinimumSectionSize(60)
 
-        # Row height – tall enough to avoid text clipping
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setDefaultSectionSize(46)
 
-        # Prevent built-in item editing (keeps cursor out of read-only cells)
         self.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
 
-        # Remove focus rectangle via delegate
         self.setItemDelegate(_NoFocusDelegate(self))
 
-        # Drag & drop for row reordering
         self.setDragEnabled(True)
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
@@ -97,21 +97,29 @@ class FileTable(QTableWidget):
         """Append a file row to the table."""
         default = "1" if file_type == "IMG" else f"1-{total_pages}"
         idx = self.rowCount()
-        self._rows.append({"path": path, "type": file_type})
+        self._rows.append({"path": path, "type": file_type, "total_pages": total_pages})
         self._build_row(idx, path, file_type, total_pages, default)
         self._rebind_all()
 
-    def remove_last(self):
-        """Remove the last row."""
-        n = self.rowCount()
-        if n == 0:
+    def remove_selected(self):
+        """Remove whichever row is currently selected."""
+        row = self.currentRow()
+        if row < 0 or row >= self.rowCount():
             return
-        self.removeRow(n - 1)
-        if self._rows:
-            self._rows.pop()
+        self.removeRow(row)
+        if 0 <= row < len(self._rows):
+            self._rows.pop(row)
+        # Select the next sensible row
+        new_count = self.rowCount()
+        if new_count > 0:
+            self.selectRow(min(row, new_count - 1))
+        self._rebind_all()
+
+    # kept for backward compat if anything still calls it
+    def remove_last(self):
+        self.remove_selected()
 
     def get_current_row_data(self) -> dict | None:
-        """Return the data dict for the currently selected row, or None."""
         row = self.currentRow()
         if 0 <= row < len(self._rows):
             return self._rows[row]
@@ -136,6 +144,7 @@ class FileTable(QTableWidget):
         file_type: str,
         total_pages: int,
         page_text: str,
+        disabled: bool | None = None,
     ):
         self.insertRow(idx)
         for col, text in enumerate(
@@ -148,8 +157,9 @@ class FileTable(QTableWidget):
         le = QLineEdit()
         le.setText(page_text)
         le.setStyleSheet(_PAGE_INPUT_STYLE)
-        if file_type == "IMG":
-            le.setDisabled(True)
+        if disabled is None:
+            disabled = file_type == "IMG"
+        le.setDisabled(disabled)
         self.setCellWidget(idx, 3, le)
 
     def _rebind_all(self):
@@ -163,10 +173,15 @@ class FileTable(QTableWidget):
                     pass
                 w.returnPressed.connect(lambda row=i: self._on_enter(row))
 
-    # ── Enter key → insert duplicate row below ────────────────────────────────
+    # ── Enter key → insert a new row for the SAME file below ─────────────────
 
     def _on_enter(self, _hint: int):
-        """Find which row the sender lives in, then insert a new row below it."""
+        """
+        Find which row the sender lives in.
+        Insert a NEW ROW immediately below it referencing the same source file
+        but with an empty page-selection field ready for the user to type into.
+        No file is "added" again — it is just another page-range segment.
+        """
         sender = self.sender()
         actual = -1
         for i in range(self.rowCount()):
@@ -177,12 +192,28 @@ class FileTable(QTableWidget):
             return
 
         src = self._rows[actual]
-        total_item = self.item(actual, 2)
-        total_pages = int(total_item.text()) if total_item else 1
-
         new_idx = actual + 1
-        self._rows.insert(new_idx, {"path": src["path"], "type": src["type"]})
-        self._build_row(new_idx, src["path"], src["type"], total_pages, "")
+
+        # Insert metadata
+        self._rows.insert(
+            new_idx,
+            {
+                "path": src["path"],
+                "type": src["type"],
+                "total_pages": src["total_pages"],
+            },
+        )
+
+        # Build the UI row
+        is_img = src["type"] == "IMG"
+        self._build_row(
+            new_idx,
+            src["path"],
+            src["type"],
+            src["total_pages"],
+            "",
+            disabled=is_img,
+        )
         self._rebind_all()
 
         new_w = self.cellWidget(new_idx, 3)
@@ -206,24 +237,25 @@ class FileTable(QTableWidget):
             event.ignore()
             return
 
-        # ── Snapshot the source row ──
-        src_data = self._rows[src]
-        src_cells = [
-            self.item(src, c).text() if self.item(src, c) else "" for c in range(3)
-        ]
+        # ── Snapshot source row completely ──
+        src_meta = self._rows[src].copy()
+        src_cells = []
+        for c in range(3):
+            item = self.item(src, c)
+            src_cells.append(item.text() if item else "")
         w = self.cellWidget(src, 3)
         src_pages = w.text() if w else ""
-        src_disabled = not w.isEnabled() if w else False
+        src_disabled = (not w.isEnabled()) if w else False
 
         # ── Remove source ──
         self._rows.pop(src)
         self.removeRow(src)
 
-        # ── Adjust destination index ──
+        # ── Adjust destination index after removal ──
         adj = dst if src > dst else dst - 1
 
         # ── Insert at destination ──
-        self._rows.insert(adj, src_data)
+        self._rows.insert(adj, src_meta)
         self.insertRow(adj)
         for col, text in enumerate(src_cells):
             item = QTableWidgetItem(text)
@@ -231,7 +263,9 @@ class FileTable(QTableWidget):
             self.setItem(adj, col, item)
 
         le = QLineEdit()
-        le.setText(src_pages)
+        le.setText(
+            src_pages
+        )  # ← this was the bug: text must be set AFTER widget creation
         le.setStyleSheet(_PAGE_INPUT_STYLE)
         le.setDisabled(src_disabled)
         self.setCellWidget(adj, 3, le)

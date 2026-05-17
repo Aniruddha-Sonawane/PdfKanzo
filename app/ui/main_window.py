@@ -83,7 +83,7 @@ class MainWindow(QMainWindow):
         for label, slot in [
             ("Add PDF", self._add_pdf),
             ("Add Image", self._add_image),
-            ("Remove Last", self._remove_last),
+            ("Remove", self._remove_selected),  # ← renamed
         ]:
             action = QAction(label, self)
             action.triggered.connect(slot)
@@ -237,8 +237,9 @@ class MainWindow(QMainWindow):
         for f in files:
             self.table.add_file(f, "IMG", 1)
 
-    def _remove_last(self):
-        self.table.remove_last()
+    def _remove_selected(self):
+        """Remove the currently selected row."""
+        self.table.remove_selected()
 
     def _merge_pdf(self):
         rows = self.table.get_all_rows()
