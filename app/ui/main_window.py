@@ -1,468 +1,263 @@
 import os
 
-import fitz
-
 from PySide6.QtCore import Qt
-
-from PySide6.QtGui import (
-    QAction,
-    QImage,
-    QPixmap,
-)
-
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QCheckBox,
     QFileDialog,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
-
 from pypdf import PdfReader
 
 from core.pdf_merger import merge_files
+from ui.file_table import FileTable
+from ui.pdf_viewer import PdfViewer
 
 
 class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-
-        self.rows = []
-
         self.setWindowTitle("PdfKanzo")
+        self._setup_ui()
+        self._apply_styles()
 
-        self.setup_ui()
+    # ── UI construction ───────────────────────────────────────────────────────
 
-    def setup_ui(self):
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
 
-        central_widget = QWidget()
-
-        self.setCentralWidget(central_widget)
-
-        main_layout = QHBoxLayout()
-
-        central_widget.setLayout(main_layout)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
 
         splitter = QSplitter(Qt.Horizontal)
-
         main_layout.addWidget(splitter)
 
-        #
-        # LEFT SIDE — PDF VIEWER
-        #
+        # Left panel – PDF viewer
+        self.viewer = PdfViewer()
+        splitter.addWidget(self.viewer)
 
-        viewer_widget = QWidget()
-
-        viewer_layout = QVBoxLayout()
-
-        viewer_widget.setLayout(viewer_layout)
-
-        viewer_title = QLabel("PDF Preview")
-
-        viewer_title.setAlignment(Qt.AlignCenter)
-
-        viewer_title.setStyleSheet("""
-            font-size: 22px;
-            font-weight: bold;
-            padding: 10px;
-            color: white;
-        """)
-
-        viewer_layout.addWidget(viewer_title)
-
-        self.scroll_area = QScrollArea()
-
-        self.scroll_area.setWidgetResizable(True)
-
-        self.scroll_area.setStyleSheet("""
-            border: none;
-            background: #1e1e1e;
-        """)
-
-        self.preview_container = QWidget()
-
-        self.preview_layout = QVBoxLayout()
-
-        self.preview_layout.setAlignment(Qt.AlignTop)
-
-        self.preview_container.setLayout(self.preview_layout)
-
-        self.scroll_area.setWidget(self.preview_container)
-
-        viewer_layout.addWidget(self.scroll_area)
-
-        #
-        # RIGHT SIDE — CONTROLS
-        #
-
-        right_widget = QWidget()
-
-        layout = QVBoxLayout()
-
-        right_widget.setLayout(layout)
+        # Right panel – file list + controls
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(8, 0, 8, 8)
+        right_layout.setSpacing(8)
 
         title = QLabel("PdfKanzo")
-
         title.setAlignment(Qt.AlignCenter)
-
-        title.setStyleSheet("""
-            font-size: 28px;
-            font-weight: bold;
-            padding: 15px;
-            color: white;
-        """)
-
-        layout.addWidget(title)
-
-        self.table = QTableWidget()
-
-        self.table.setColumnCount(4)
-
-        self.table.setHorizontalHeaderLabels(
-            ["File", "Type", "Pages", "Page Selection"]
+        title.setStyleSheet(
+            "font-size: 28px; font-weight: bold; padding: 15px; color: white;"
         )
+        right_layout.addWidget(title)
 
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table = FileTable()
+        self.table.selection_changed.connect(self._on_selection_changed)
+        right_layout.addWidget(self.table)
 
-        self.table.selectionModel().selectionChanged.connect(self.preview_selected_pdf)
-
-        layout.addWidget(self.table)
-
-        bottom_layout = QHBoxLayout()
-
+        bottom = QHBoxLayout()
         self.output_name = QLineEdit()
-
         self.output_name.setPlaceholderText("Output PDF Name")
+        merge_btn = QPushButton("Merge PDF")
+        merge_btn.clicked.connect(self._merge_pdf)
+        bottom.addWidget(self.output_name)
+        bottom.addWidget(merge_btn)
+        right_layout.addLayout(bottom)
 
-        merge_button = QPushButton("Merge PDF")
-
-        merge_button.clicked.connect(self.merge_pdf)
-
-        bottom_layout.addWidget(self.output_name)
-
-        bottom_layout.addWidget(merge_button)
-
-        layout.addLayout(bottom_layout)
-
-        self.create_toolbar()
-
-        splitter.addWidget(viewer_widget)
-
-        splitter.addWidget(right_widget)
-
+        splitter.addWidget(right)
         splitter.setSizes([700, 700])
 
+        self._create_toolbar()
+
+    def _create_toolbar(self):
+        tb = QToolBar()
+        self.addToolBar(tb)
+        for label, slot in [
+            ("Add PDF", self._add_pdf),
+            ("Add Image", self._add_image),
+            ("Remove Last", self._remove_last),
+        ]:
+            action = QAction(label, self)
+            action.triggered.connect(slot)
+            tb.addAction(action)
+
+    # ── Stylesheet ────────────────────────────────────────────────────────────
+
+    def _apply_styles(self):
         self.setStyleSheet("""
             QMainWindow {
                 background: #1e1e1e;
             }
 
-            QLabel {
-                color: white;
+            QWidget {
+                background: #1e1e1e;
             }
 
+            QLabel {
+                color: white;
+                background: transparent;
+            }
+
+            /* ── Table ── */
             QTableWidget {
                 background: #2a2a2a;
                 color: white;
-                gridline-color: #444;
+                gridline-color: #3a3a3a;
                 border: none;
                 font-size: 14px;
+                outline: 0;
             }
-
+            QTableWidget::item {
+                padding: 6px 10px;
+            }
+            QTableWidget::item:selected {
+                background: #3a3a5c;
+                color: white;
+            }
+            QTableWidget::item:focus {
+                background: #3a3a5c;
+                outline: none;
+                border: none;
+            }
             QHeaderView::section {
                 background: #333;
                 color: white;
-                padding: 8px;
+                padding: 8px 10px;
                 border: none;
+                font-size: 13px;
             }
 
+            /* ── Buttons ── */
             QPushButton {
                 background: #3a86ff;
                 color: white;
                 border: none;
-                padding: 10px;
+                padding: 10px 18px;
                 border-radius: 8px;
                 font-size: 14px;
             }
-
             QPushButton:hover {
                 background: #5396ff;
             }
 
+            /* ── Line edits (output name field) ── */
             QLineEdit {
                 padding: 10px;
                 border-radius: 8px;
                 background: #2a2a2a;
                 color: white;
                 border: 1px solid #444;
+                font-size: 14px;
             }
 
+            /* ── Toolbar ── */
+            QToolBar {
+                background: #242424;
+                border-bottom: 1px solid #333;
+                padding: 4px 6px;
+                spacing: 4px;
+            }
+            QToolButton {
+                color: white;
+                background: #333;
+                border: none;
+                padding: 6px 14px;
+                border-radius: 6px;
+                font-size: 13px;
+            }
+            QToolButton:hover {
+                background: #444;
+            }
+
+            /* ── Checkboxes (in viewer) ── */
             QCheckBox {
                 color: white;
-                font-size: 14px;
-                padding: 5px;
+                font-size: 13px;
+                padding: 3px;
+                background: transparent;
+            }
+
+            /* ── Scrollbars ── */
+            QScrollBar:vertical {
+                background: #242424;
+                width: 8px;
+                border-radius: 4px;
+            }
+            QScrollBar::handle:vertical {
+                background: #555;
+                border-radius: 4px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {
+                height: 0;
+            }
+            QScrollArea {
+                border: none;
+                background: #1e1e1e;
+            }
+
+            /* ── Splitter ── */
+            QSplitter::handle {
+                background: #333;
+                width: 1px;
             }
         """)
 
-    def create_toolbar(self):
+    # ── Slots ─────────────────────────────────────────────────────────────────
 
-        toolbar = QToolBar()
+    def _on_selection_changed(self):
+        data = self.table.get_current_row_data()
+        if data and data["type"] == "PDF":
+            self.viewer.load_pdf(data["path"])
 
-        self.addToolBar(toolbar)
-
-        add_pdf_action = QAction("Add PDF", self)
-
-        add_image_action = QAction("Add Image", self)
-
-        remove_action = QAction("Remove Last", self)
-
-        add_pdf_action.triggered.connect(self.add_pdf)
-
-        add_image_action.triggered.connect(self.add_image)
-
-        remove_action.triggered.connect(self.remove_last)
-
-        toolbar.addAction(add_pdf_action)
-
-        toolbar.addAction(add_image_action)
-
-        toolbar.addAction(remove_action)
-
-    def add_pdf(self):
-
+    def _add_pdf(self):
         files, _ = QFileDialog.getOpenFileNames(
             self, "Select PDFs", "", "PDF Files (*.pdf)"
         )
+        for f in files:
+            reader = PdfReader(f)
+            self.table.add_file(f, "PDF", len(reader.pages))
 
-        if not files:
-            return
-
-        for file in files:
-
-            reader = PdfReader(file)
-
-            total = len(reader.pages)
-
-            self.add_row(file, "PDF", total)
-
-    def add_image(self):
-
+    def _add_image(self):
         files, _ = QFileDialog.getOpenFileNames(
-            self, "Select Images", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tiff)"
+            self,
+            "Select Images",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.tiff)",
         )
-
-        if not files:
-            return
-
-        for file in files:
-
-            self.add_row(file, "IMG", 1)
-
-    def add_row(self, path, file_type, total_pages):
-
-        row = self.table.rowCount()
-
-        self.table.insertRow(row)
-
-        self.table.setItem(row, 0, QTableWidgetItem(os.path.basename(path)))
-
-        self.table.setItem(row, 1, QTableWidgetItem(file_type))
-
-        self.table.setItem(row, 2, QTableWidgetItem(str(total_pages)))
-
-        page_input = QLineEdit()
-
-        if file_type == "IMG":
-
-            page_input.setText("1")
-            page_input.setDisabled(True)
-
-        else:
-
-            page_input.setText(f"1-{total_pages}")
-
-        self.table.setCellWidget(row, 3, page_input)
-
-        self.rows.append(
-            {
-                "path": path,
-                "type": file_type,
-                "pages": page_input.text(),
-            }
-        )
-
-    def remove_last(self):
-
-        row_count = self.table.rowCount()
-
-        if row_count == 0:
-            return
-
-        self.table.removeRow(row_count - 1)
-
-        self.rows.pop()
-
-    def preview_selected_pdf(self):
-
-        selected = self.table.currentRow()
-
-        if selected < 0:
-            return
-
-        row = self.rows[selected]
-
-        if row["type"] != "PDF":
-            return
-
-        pdf_path = row["path"]
-
-        try:
-
-            #
-            # CLEAR OLD PREVIEW
-            #
-
-            while self.preview_layout.count():
-
-                item = self.preview_layout.takeAt(0)
-
-                widget = item.widget()
-
-                if widget:
-                    widget.deleteLater()
-
-            #
-            # OPEN PDF
-            #
-
-            doc = fitz.open(pdf_path)
-
-            #
-            # RENDER ALL PAGES
-            #
-
-            for page_number in range(len(doc)):
-
-                page = doc.load_page(page_number)
-
-                #
-                # LOWER RESOLUTION RENDER
-                #
-
-                pix = page.get_pixmap(matrix=fitz.Matrix(0.45, 0.45))
-
-                image = QImage(
-                    pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
-                )
-
-                pixmap = QPixmap.fromImage(image)
-
-                #
-                # SMALLER PREVIEW WIDTH
-                #
-
-                scaled_pixmap = pixmap.scaledToWidth(320, Qt.SmoothTransformation)
-
-                #
-                # PAGE CONTAINER
-                #
-
-                page_widget = QWidget()
-
-                page_layout = QVBoxLayout()
-
-                page_widget.setLayout(page_layout)
-
-                #
-                # PAGE CHECKBOX
-                #
-
-                checkbox = QCheckBox(f"Page {page_number + 1}")
-
-                checkbox.setChecked(True)
-
-                #
-                # PAGE IMAGE
-                #
-
-                label = QLabel()
-
-                label.setAlignment(Qt.AlignCenter)
-
-                label.setPixmap(scaled_pixmap)
-
-                label.setStyleSheet("""
-                    background: white;
-                    padding: 10px;
-                    border-radius: 10px;
-                """)
-
-                #
-                # ADD TO LAYOUT
-                #
-
-                page_layout.addWidget(checkbox)
-
-                page_layout.addWidget(label)
-
-                self.preview_layout.addWidget(page_widget)
-
-        except Exception as e:
-
-            QMessageBox.critical(self, "Preview Error", str(e))
-
-    def merge_pdf(self):
-
-        if not self.rows:
-
+        for f in files:
+            self.table.add_file(f, "IMG", 1)
+
+    def _remove_last(self):
+        self.table.remove_last()
+
+    def _merge_pdf(self):
+        rows = self.table.get_all_rows()
+        if not rows:
             QMessageBox.warning(self, "Error", "No files added")
-
             return
 
-        output_name = self.output_name.text().strip()
-
-        if not output_name:
-
-            QMessageBox.warning(self, "Error", "Enter output name")
-
+        name = self.output_name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Error", "Enter an output file name")
             return
-
-        if not output_name.endswith(".pdf"):
-
-            output_name += ".pdf"
+        if not name.endswith(".pdf"):
+            name += ".pdf"
 
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-
-        output_path = os.path.join(desktop, output_name)
-
-        updated_rows = []
-
-        for index, row in enumerate(self.rows):
-
-            page_widget = self.table.cellWidget(index, 3)
-
-            updated_rows.append(
-                {"path": row["path"], "type": row["type"], "pages": page_widget.text()}
-            )
+        out_path = os.path.join(desktop, name)
 
         try:
-
-            merge_files(updated_rows, output_path)
-
-            QMessageBox.information(self, "Success", f"Saved to:\n{output_path}")
-
-        except Exception as e:
-
-            QMessageBox.critical(self, "Error", str(e))
+            merge_files(rows, out_path)
+            QMessageBox.information(self, "Success", f"Saved to:\n{out_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Merge Error", str(exc))
