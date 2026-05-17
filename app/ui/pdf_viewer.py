@@ -1,10 +1,9 @@
 import fitz
 
 from PySide6.QtCore import Qt, QThread, Signal, QRectF
-from PySide6.QtGui import QImage, QPixmap, QWheelEvent, QTransform
+from PySide6.QtGui import QImage, QPixmap, QTransform, QWheelEvent
 from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
-    QGraphicsRectItem,
     QGraphicsScene,
     QGraphicsView,
     QLabel,
@@ -12,16 +11,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-_RENDER_SCALE = 2.0  # render at 2× (144 DPI) – stored once, never re-rendered
+_RENDER_SCALE = 2.0  # render at 2× (144 DPI)
+_PAGE_SCALE = 1.0 / _RENDER_SCALE
+_PAGE_GAP = 16
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Render thread – fires once per PDF load
+#  Render thread
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class _RenderThread(QThread):
-    page_ready = Signal(int, QPixmap, float, float)  # n, pixmap, pt_w, pt_h
+    page_ready = Signal(int, QPixmap, float, float)
     render_done = Signal()
 
     def __init__(self, path: str):
@@ -54,24 +55,17 @@ class _RenderThread(QThread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  QGraphicsView – zoom via transform, NO pixmap scaling ever
+#  Graphics view with Ctrl+Scroll zoom
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 class _PdfGraphicsView(QGraphicsView):
-    """
-    Zoom works by calling self.scale() which changes the view transform.
-    Qt re-draws the scene using the GPU-accelerated painter – instant at any
-    zoom level regardless of how many pages are loaded.
-    """
-
     _MIN_ZOOM = 0.10
     _MAX_ZOOM = 8.0
 
     def __init__(self, scene: QGraphicsScene):
         super().__init__(scene)
         self._zoom_level = 1.0
-
         self.setRenderHint(self.renderHints().Antialiasing, True)
         self.setRenderHint(self.renderHints().SmoothPixmapTransform, True)
         self.setDragMode(QGraphicsView.ScrollHandDrag)
@@ -79,7 +73,6 @@ class _PdfGraphicsView(QGraphicsView):
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setBackgroundBrush(Qt.black)  # will be overridden by stylesheet
         self.setStyleSheet("background: #2b2b2b; border: none;")
 
     def wheelEvent(self, event: QWheelEvent):
@@ -89,14 +82,10 @@ class _PdfGraphicsView(QGraphicsView):
             if abs(new_z - self._zoom_level) > 1e-4:
                 ratio = new_z / self._zoom_level
                 self._zoom_level = new_z
-                self.scale(ratio, ratio)  # ← the entire secret: ONE call, instant
+                self.scale(ratio, ratio)
             event.accept()
         else:
-            # normal scroll: just scroll vertically
             super().wheelEvent(event)
-
-    def zoom_level(self) -> float:
-        return self._zoom_level
 
     def reset_zoom(self):
         self.setTransform(QTransform())
@@ -104,20 +93,30 @@ class _PdfGraphicsView(QGraphicsView):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  PdfViewer widget
+#  PdfViewer  –  caches every scene by path, never re-renders on re-click
 # ─────────────────────────────────────────────────────────────────────────────
-
-_PAGE_GAP = 16  # vertical gap between pages in scene units
-_PAGE_SCALE = 1.0 / _RENDER_SCALE  # display pixmap at 1:1 PDF points
 
 
 class PdfViewer(QWidget):
+    """
+    _scene_cache: dict[path -> QGraphicsScene]
+      Rendered once, swapped instantly on re-click. No re-render ever.
+    _thread_cache: dict[path -> bool]
+      Tracks which paths are fully rendered (True) or still loading (False).
+    """
 
     def __init__(self):
         super().__init__()
         self._thread: _RenderThread | None = None
-        self._path: str | None = None
-        self._y_cursor = 0.0  # where to place the next page in the scene
+        self._current_path: str | None = None
+        self._loading_path: str | None = None  # path being rendered right now
+
+        # path → QGraphicsScene (fully or partially built)
+        self._scene_cache: dict[str, QGraphicsScene] = {}
+        # path → y cursor (where next page goes in that scene)
+        self._y_cache: dict[str, float] = {}
+        # path → loading text item (removed when first page arrives)
+        self._loading_item: dict[str, object] = {}
 
         self._setup_ui()
 
@@ -136,13 +135,7 @@ class PdfViewer(QWidget):
         )
         root.addWidget(hdr)
 
-        self._zoom_label = QLabel("Ctrl + Scroll  ·  zoom in/out")
-        self._zoom_label.setAlignment(Qt.AlignCenter)
-        self._zoom_label.setStyleSheet(
-            "color: #555; font-size: 11px; padding: 3px; background: #1a1a1a;"
-        )
-        root.addWidget(self._zoom_label)
-
+        # Single shared scene + view; we swap the scene when switching PDFs
         self._scene = QGraphicsScene()
         self._view = _PdfGraphicsView(self._scene)
         root.addWidget(self._view)
@@ -150,17 +143,38 @@ class PdfViewer(QWidget):
     # ── Public ───────────────────────────────────────────────────────────────
 
     def load_pdf(self, path: str):
-        self._path = path
-        self._stop_thread()
-        self._scene.clear()
-        self._y_cursor = 0.0
+        """
+        If this path was already rendered (or is being rendered), just swap
+        the scene instantly — no thread, no delay.
+        If it's new, start a render thread and cache the scene as pages arrive.
+        """
+        if path == self._current_path:
+            return  # already showing this PDF
+
+        self._current_path = path
+
+        if path in self._scene_cache:
+            # ── Cache hit: swap scene instantly ──────────────────────────────
+            self._view.setScene(self._scene_cache[path])
+            self._view.reset_zoom()
+            return
+
+        # ── Cache miss: build a new scene and start rendering ────────────────
+        scene = QGraphicsScene()
+        self._scene_cache[path] = scene
+        self._y_cache[path] = 0.0
+
+        loading = scene.addText("⏳  Loading preview…")
+        loading.setDefaultTextColor(Qt.gray)
+        self._loading_item[path] = loading
+
+        self._view.setScene(scene)
         self._view.reset_zoom()
-        self._zoom_label.setText("Ctrl + Scroll  ·  zoom in/out")
 
-        # Loading placeholder text in scene
-        self._loading_item = self._scene.addText("⏳  Loading preview…")
-        self._loading_item.setDefaultTextColor(Qt.gray)
+        # Stop any in-flight render for a different path
+        self._stop_thread()
 
+        self._loading_path = path
         self._thread = _RenderThread(path)
         self._thread.page_ready.connect(self._on_page_ready)
         self._thread.render_done.connect(self._on_render_done)
@@ -169,36 +183,42 @@ class PdfViewer(QWidget):
     # ── Thread callbacks ──────────────────────────────────────────────────────
 
     def _on_page_ready(self, n: int, pixmap: QPixmap, pt_w: float, pt_h: float):
+        path = self._loading_path
+        if path not in self._scene_cache:
+            return
+        scene = self._scene_cache[path]
+
         # Remove loading placeholder on first page
-        if hasattr(self, "_loading_item") and self._loading_item:
-            self._scene.removeItem(self._loading_item)
-            self._loading_item = None
+        li = self._loading_item.pop(path, None)
+        if li:
+            scene.removeItem(li)
 
-        # Scale the pixmap item so it displays at PDF-point size (1pt = 1px at 100%)
-        item = QGraphicsPixmapItem(pixmap)
-        item.setTransformationMode(Qt.SmoothTransformation)  # GPU smooth, zero cost
-        item.setScale(_PAGE_SCALE)  # scale item, not pixmap
+        y = self._y_cache.get(path, 0.0)
 
-        # White background shadow rect
-        bg = self._scene.addRect(
-            QRectF(0, self._y_cursor, pt_w, pt_h),
-            pen=Qt.NoPen,
-        )
+        # White page background
+        bg = scene.addRect(QRectF(0, y, pt_w, pt_h), pen=Qt.NoPen)
         bg.setBrush(Qt.white)
 
-        item.setPos(0, self._y_cursor)
-        self._scene.addItem(item)
+        # Page pixmap item – scaled via item transform, not pixel copy
+        item = QGraphicsPixmapItem(pixmap)
+        item.setTransformationMode(Qt.SmoothTransformation)
+        item.setScale(_PAGE_SCALE)
+        item.setPos(0, y)
+        scene.addItem(item)
 
-        self._y_cursor += pt_h + _PAGE_GAP
+        # Page number label below the page
+        num_item = scene.addText(f"— {n + 1} —")
+        num_item.setDefaultTextColor(Qt.gray)
+        num_item.setPos(pt_w / 2 - num_item.boundingRect().width() / 2, y + pt_h + 2)
 
-        # Update zoom label with percentage
-        pct = int(self._view.zoom_level() * 100)
-        self._zoom_label.setText(f"Ctrl + Scroll to zoom  ·  {pct}%")
+        self._y_cache[path] = y + pt_h + _PAGE_GAP
 
     def _on_render_done(self):
-        if hasattr(self, "_loading_item") and self._loading_item:
-            self._scene.removeItem(self._loading_item)
-            self._loading_item = None
+        path = self._loading_path
+        li = self._loading_item.pop(path, None)
+        if li and path in self._scene_cache:
+            self._scene_cache[path].removeItem(li)
+        self._loading_path = None
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
