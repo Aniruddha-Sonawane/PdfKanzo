@@ -1,8 +1,17 @@
 import os
 
+import fitz
+
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
+
+from PySide6.QtGui import (
+    QAction,
+    QImage,
+    QPixmap,
+)
+
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -11,6 +20,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
@@ -40,9 +51,67 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(central_widget)
 
+        main_layout = QHBoxLayout()
+
+        central_widget.setLayout(main_layout)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        main_layout.addWidget(splitter)
+
+        #
+        # LEFT SIDE — PDF VIEWER
+        #
+
+        viewer_widget = QWidget()
+
+        viewer_layout = QVBoxLayout()
+
+        viewer_widget.setLayout(viewer_layout)
+
+        viewer_title = QLabel("PDF Preview")
+
+        viewer_title.setAlignment(Qt.AlignCenter)
+
+        viewer_title.setStyleSheet("""
+            font-size: 22px;
+            font-weight: bold;
+            padding: 10px;
+            color: white;
+        """)
+
+        viewer_layout.addWidget(viewer_title)
+
+        self.scroll_area = QScrollArea()
+
+        self.scroll_area.setWidgetResizable(True)
+
+        self.scroll_area.setStyleSheet("""
+            border: none;
+            background: #1e1e1e;
+        """)
+
+        self.preview_container = QWidget()
+
+        self.preview_layout = QVBoxLayout()
+
+        self.preview_layout.setAlignment(Qt.AlignTop)
+
+        self.preview_container.setLayout(self.preview_layout)
+
+        self.scroll_area.setWidget(self.preview_container)
+
+        viewer_layout.addWidget(self.scroll_area)
+
+        #
+        # RIGHT SIDE — CONTROLS
+        #
+
+        right_widget = QWidget()
+
         layout = QVBoxLayout()
 
-        central_widget.setLayout(layout)
+        right_widget.setLayout(layout)
 
         title = QLabel("PdfKanzo")
 
@@ -52,6 +121,7 @@ class MainWindow(QMainWindow):
             font-size: 28px;
             font-weight: bold;
             padding: 15px;
+            color: white;
         """)
 
         layout.addWidget(title)
@@ -65,6 +135,8 @@ class MainWindow(QMainWindow):
         )
 
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+
+        self.table.selectionModel().selectionChanged.connect(self.preview_selected_pdf)
 
         layout.addWidget(self.table)
 
@@ -85,6 +157,12 @@ class MainWindow(QMainWindow):
         layout.addLayout(bottom_layout)
 
         self.create_toolbar()
+
+        splitter.addWidget(viewer_widget)
+
+        splitter.addWidget(right_widget)
+
+        splitter.setSizes([700, 700])
 
         self.setStyleSheet("""
             QMainWindow {
@@ -129,6 +207,12 @@ class MainWindow(QMainWindow):
                 background: #2a2a2a;
                 color: white;
                 border: 1px solid #444;
+            }
+
+            QCheckBox {
+                color: white;
+                font-size: 14px;
+                padding: 5px;
             }
         """)
 
@@ -229,6 +313,115 @@ class MainWindow(QMainWindow):
         self.table.removeRow(row_count - 1)
 
         self.rows.pop()
+
+    def preview_selected_pdf(self):
+
+        selected = self.table.currentRow()
+
+        if selected < 0:
+            return
+
+        row = self.rows[selected]
+
+        if row["type"] != "PDF":
+            return
+
+        pdf_path = row["path"]
+
+        try:
+
+            #
+            # CLEAR OLD PREVIEW
+            #
+
+            while self.preview_layout.count():
+
+                item = self.preview_layout.takeAt(0)
+
+                widget = item.widget()
+
+                if widget:
+                    widget.deleteLater()
+
+            #
+            # OPEN PDF
+            #
+
+            doc = fitz.open(pdf_path)
+
+            #
+            # RENDER ALL PAGES
+            #
+
+            for page_number in range(len(doc)):
+
+                page = doc.load_page(page_number)
+
+                #
+                # LOWER RESOLUTION RENDER
+                #
+
+                pix = page.get_pixmap(matrix=fitz.Matrix(0.45, 0.45))
+
+                image = QImage(
+                    pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888
+                )
+
+                pixmap = QPixmap.fromImage(image)
+
+                #
+                # SMALLER PREVIEW WIDTH
+                #
+
+                scaled_pixmap = pixmap.scaledToWidth(320, Qt.SmoothTransformation)
+
+                #
+                # PAGE CONTAINER
+                #
+
+                page_widget = QWidget()
+
+                page_layout = QVBoxLayout()
+
+                page_widget.setLayout(page_layout)
+
+                #
+                # PAGE CHECKBOX
+                #
+
+                checkbox = QCheckBox(f"Page {page_number + 1}")
+
+                checkbox.setChecked(True)
+
+                #
+                # PAGE IMAGE
+                #
+
+                label = QLabel()
+
+                label.setAlignment(Qt.AlignCenter)
+
+                label.setPixmap(scaled_pixmap)
+
+                label.setStyleSheet("""
+                    background: white;
+                    padding: 10px;
+                    border-radius: 10px;
+                """)
+
+                #
+                # ADD TO LAYOUT
+                #
+
+                page_layout.addWidget(checkbox)
+
+                page_layout.addWidget(label)
+
+                self.preview_layout.addWidget(page_widget)
+
+        except Exception as e:
+
+            QMessageBox.critical(self, "Preview Error", str(e))
 
     def merge_pdf(self):
 
